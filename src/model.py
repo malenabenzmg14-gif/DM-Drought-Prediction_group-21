@@ -8,7 +8,7 @@ import os
 
 
 def get_feature_columns(df):
-    """Get all feature columns (exclude meta columns)."""
+    #"""Get all feature columns (exclude meta columns)."""
     exclude = ['region_id', 'date', 'score']
     return [c for c in df.columns if c not in exclude]
 

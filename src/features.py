@@ -3,8 +3,14 @@ import numpy as np
 
 
 def load_data(train_path, test_path):
-    train = pd.read_csv(train_path, parse_dates=['date'])
-    test = pd.read_csv(test_path, parse_dates=['date'])
+    print("Loading train...")
+    train = pd.read_csv(train_path)
+    train['date'] = pd.to_datetime(train['date'], errors='coerce')
+    
+    print("Loading test...")
+    test = pd.read_csv(test_path)
+    test['date'] = pd.to_datetime(test['date'], errors='coerce')
+    
     return train, test
 
 
@@ -20,15 +26,20 @@ def build_weekly_features(df):
     ]
 
     records = []
+    regions = df['region_id'].unique()
+    total = len(regions)
 
-    for region, group in df.groupby('region_id'):
-        group = group.sort_values('date').reset_index(drop=True)
+    for i, region in enumerate(regions):
+        if i % 100 == 0:
+            print(f"  Processing region {i+1}/{total}...")
+
+        group = df[df['region_id'] == region].sort_values('date').reset_index(drop=True)
 
         # Get score rows (weekly labels)
         if 'score' in group.columns:
             score_rows = group[group['score'].notna()].copy()
         else:
-            # For test data, treat every 7th row as a "week end"
+            # For test data, treat every 7th row as week end
             score_rows = group.iloc[6::7].copy()
 
         for idx, row in score_rows.iterrows():
@@ -62,7 +73,7 @@ def build_weekly_features(df):
 
 def add_lag_features(df, n_lags=4):
     """
-    Add lag features: previous weeks' scores and weather per region.
+    Add lag features: previous weeks scores and weather per region.
     """
     df = df.sort_values(['region_id', 'date']).reset_index(drop=True)
 
