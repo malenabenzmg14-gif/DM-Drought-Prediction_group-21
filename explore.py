@@ -1,17 +1,16 @@
-
-
 import pandas as pd
+import numpy as np
 
-train = pd.read_csv('data/train.csv')
-train['date'] = pd.to_datetime(train['date'], errors='coerce')
-test = pd.read_csv('data/test.csv')
-test['date'] = pd.to_datetime(test['date'], errors='coerce')
+# Reproduce submission_v2 exactly and check predictions
+sub2 = pd.read_csv('submission_v2.csv')
+sub10 = pd.read_csv('submission_v10.csv')
 
-# Check test data structure
-print("Test regions:", test['region_id'].nunique())
-print("Test rows per region:")
-print(test.groupby('region_id').size().describe())
-print("\nFirst region dates:")
-print(test[test['region_id'] == test['region_id'].iloc[0]]['date'].sort_values().tail(10))
-print("\nLast 3 dates in test:")
-print(test.sort_values('date').tail(3)[['region_id','date']])
+print("submission_v2 stats:")
+print(sub2[['pred_week1','pred_week2','pred_week3','pred_week4','pred_week5']].describe())
+
+print("\nsubmission_v10 stats:")
+print(sub10[['pred_week1','pred_week2','pred_week3','pred_week4','pred_week5']].describe())
+
+print("\nDifference (v10 - v2):")
+diff = sub10[['pred_week1','pred_week2','pred_week3','pred_week4','pred_week5']].values - sub2[['pred_week1','pred_week2','pred_week3','pred_week4','pred_week5']].values
+print(pd.DataFrame(diff).describe())
