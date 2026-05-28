@@ -1,17 +1,18 @@
-import os
 import warnings
+warnings.filterwarnings("ignore")
 
-import numpy as np
 import pandas as pd
+import numpy as np
+
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error
 
-warnings.filterwarnings("ignore")
 
 TRAIN_PATH = "data/train.csv"
 TEST_PATH = "data/test.csv"
 SAMPLE_SUB_PATH = "data/sample_submission.csv"
-OUTPUT_PATH = "outputs/submission_final.csv"
+OUTPUT_PATH = "submission_final_1.csv"
+
 
 WEATHER_COLS = [
     "prec", "surf_pre", "humidity", "tmp", "dp_tmp", "wb_tmp",
@@ -19,79 +20,117 @@ WEATHER_COLS = [
     "wind", "wind_max", "wind_min", "wind_range"
 ]
 
-SCORE_LAGS = [1, 2, 3, 4, 8, 12]
-ROLL_WINDOWS = [2, 4, 8, 13]
 
+def extract_date_parts(date_series):
+    s = date_series.astype(str)
+    parts = s.str.extract(r"(?P<year>\d+)-(?P<month>\d{2})-(?P<day>\d{2})")
 
-def extract_date_parts(df: pd.DataFrame) -> pd.DataFrame:
-    parts = df["date"].astype(str).str.split("-", expand=True)
-    df["year"] = parts[0].astype(np.int32)
-    df["month"] = parts[1].astype(np.int16)
-    df["day"] = parts[2].astype(np.int16)
+    year = pd.to_numeric(parts["year"], errors="coerce").fillna(0).astype(int)
+    month = pd.to_numeric(parts["month"], errors="coerce").fillna(1).astype(int)
+    day = pd.to_numeric(parts["day"], errors="coerce").fillna(1).astype(int)
 
-    month_offsets = {
-        1: 0, 2: 31, 3: 59, 4: 90, 5: 120, 6: 151,
-        7: 181, 8: 212, 9: 243, 10: 273, 11: 304, 12: 334
-    }
-    df["dayofyear"] = df["month"].map(month_offsets).astype(np.int16) + df["day"].astype(np.int16)
-    return df
-
-
-def add_basic_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = extract_date_parts(df)
-    df = df.sort_values(["region_id", "year", "month", "day"]).reset_index(drop=True)
-    df["day_number"] = df.groupby("region_id").cumcount().astype(np.int32)
-    df["week_idx"] = (df["day_number"] // 7).astype(np.int32)
-    return df
-
-
-def build_weekly_weather(df: pd.DataFrame, has_score: bool) -> pd.DataFrame:
-    agg = {
-        "month": "last",
-        "dayofyear": "last",
-    }
-
-    for col in WEATHER_COLS:
-        agg[col] = ["mean", "std", "min", "max"]
-
-    weekly = df.groupby(["region_id", "week_idx"]).agg(agg)
-    weekly.columns = [
-        f"{a}_{b}" if b else a
-        for a, b in weekly.columns.to_flat_index()
-    ]
-    weekly = weekly.reset_index()
-
-    weekly = weekly.rename(
-        columns={
-            "month_last": "month",
-            "dayofyear_last": "dayofyear"
-        }
+    pseudo_date = pd.to_datetime(
+        "2001-" + month.astype(str).str.zfill(2) + "-" + day.astype(str).str.zfill(2),
+        errors="coerce"
     )
 
-    if "prec_sum" not in weekly.columns:
-        weekly["prec_sum"] = df.groupby(["region_id", "week_idx"])["prec"].sum().values
+    dayofyear = pseudo_date.dt.dayofyear.fillna(1).astype(int)
 
-    if has_score:
-        score_weekly = (
-            df.dropna(subset=["score"])
-            .groupby(["region_id", "week_idx"])["score"]
-            .mean()
+    return year, month, day, dayofyear
+
+
+def add_basic_columns(df):
+    df = df.copy()
+
+    df["region_id"] = df["region_id"].astype(str)
+    df["region_num"] = (
+        df["region_id"]
+        .str.extract(r"(\d+)")
+        .astype(float)
+        .fillna(-1)
+        .astype(int)
+    )
+
+    year, month, day, dayofyear = extract_date_parts(df["date"])
+
+    df["year_fake"] = year
+    df["month"] = month
+    df["day"] = day
+    df["dayofyear"] = dayofyear
+
+    df = df.sort_values(["region_id", "date"]).reset_index(drop=True)
+    df["day_idx"] = df.groupby("region_id").cumcount()
+    df["week_idx"] = df["day_idx"] // 7
+
+    return df
+
+
+def build_weekly_weather(df):
+    agg_dict = {}
+
+    for col in WEATHER_COLS:
+        agg_dict[col] = ["mean", "std", "min", "max"]
+
+    weekly = df.groupby(["region_id", "week_idx"]).agg(agg_dict)
+    weekly.columns = [f"{col}_{stat}" for col, stat in weekly.columns]
+    weekly = weekly.reset_index()
+
+    week_end = (
+        df.sort_values(["region_id", "day_idx"])
+        .groupby(["region_id", "week_idx"])
+        .tail(1)[["region_id", "week_idx", "region_num", "month", "dayofyear", "year_fake"]]
+    )
+
+    weekly = weekly.merge(week_end, on=["region_id", "week_idx"], how="left")
+
+    if "score" in df.columns:
+        score_weekly = df[df["score"].notna()][["region_id", "week_idx", "score"]].copy()
+        weekly = weekly.merge(score_weekly, on=["region_id", "week_idx"], how="left")
+
+    if "prec" in df.columns:
+        prec_week = (
+            df.groupby(["region_id", "week_idx"])["prec"]
+            .agg(prec_sum="sum")
             .reset_index()
         )
-        weekly = weekly.merge(score_weekly, on=["region_id", "week_idx"], how="left")
-    else:
-        weekly["score"] = np.nan
+        weekly = weekly.merge(prec_week, on=["region_id", "week_idx"], how="left")
 
-    weekly["month_sin"] = np.sin(2 * np.pi * weekly["month"] / 12)
-    weekly["month_cos"] = np.cos(2 * np.pi * weekly["month"] / 12)
-    weekly["dayofyear_sin"] = np.sin(2 * np.pi * weekly["dayofyear"] / 365)
-    weekly["dayofyear_cos"] = np.cos(2 * np.pi * weekly["dayofyear"] / 365)
+    return weekly.sort_values(["region_id", "week_idx"]).reset_index(drop=True)
+
+
+def add_score_lags(weekly):
+    weekly = weekly.copy()
+    weekly = weekly.sort_values(["region_id", "week_idx"]).reset_index(drop=True)
+
+    for lag in [1, 2, 3, 4, 8, 12]:
+        weekly[f"score_lag_{lag}"] = weekly.groupby("region_id")["score"].shift(lag)
+
+    for window in [4, 8, 12]:
+        shifted = weekly.groupby("region_id")["score"].shift(1)
+
+        weekly[f"score_roll_mean_{window}"] = (
+            shifted.groupby(weekly["region_id"])
+            .rolling(window, min_periods=2)
+            .mean()
+            .reset_index(level=0, drop=True)
+        )
+
+        weekly[f"score_roll_std_{window}"] = (
+            shifted.groupby(weekly["region_id"])
+            .rolling(window, min_periods=2)
+            .std()
+            .reset_index(level=0, drop=True)
+        )
 
     return weekly
 
-
-def add_weekly_weather_rollups(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["region_id", "week_idx"]).copy()
+def add_weekly_weather_rollups(weekly):
+    """
+    Adds rolling weather features over the last 2, 4, 8 and 13 weeks.
+    This lets the model use the full 91-day input window.
+    """
+    weekly = weekly.copy()
+    weekly = weekly.sort_values(["region_id", "week_idx"]).reset_index(drop=True)
 
     base_cols = [
         "prec_sum",
@@ -101,278 +140,365 @@ def add_weekly_weather_rollups(df: pd.DataFrame) -> pd.DataFrame:
         "tmp_max_mean",
         "tmp_min_mean",
         "wind_mean",
-        "surf_pre_mean",
+        "surf_pre_mean"
     ]
 
-    base_cols = [c for c in base_cols if c in df.columns]
+    base_cols = [c for c in base_cols if c in weekly.columns]
 
     for col in base_cols:
-        for window in ROLL_WINDOWS:
-            df[f"{col}_roll{window}_mean"] = (
-                df.groupby("region_id")[col]
-                .transform(lambda s: s.rolling(window, min_periods=1).mean())
-            )
-            df[f"{col}_roll{window}_std"] = (
-                df.groupby("region_id")[col]
-                .transform(lambda s: s.rolling(window, min_periods=2).std())
-                .fillna(0)
+        for window in [2, 4, 8, 13]:
+            weekly[f"{col}_roll_mean_{window}"] = (
+                weekly.groupby("region_id")[col]
+                .rolling(window, min_periods=1)
+                .mean()
+                .reset_index(level=0, drop=True)
             )
 
-    if "prec_sum_roll4_mean" in df.columns and "prec_sum_roll13_mean" in df.columns:
-        df["prec_4w_vs_13w"] = df["prec_sum_roll4_mean"] - df["prec_sum_roll13_mean"]
+            weekly[f"{col}_roll_std_{window}"] = (
+                weekly.groupby("region_id")[col]
+                .rolling(window, min_periods=2)
+                .std()
+                .reset_index(level=0, drop=True)
+            )
 
-    if "humidity_mean_roll4_mean" in df.columns and "humidity_mean_roll13_mean" in df.columns:
-        df["humidity_4w_vs_13w"] = df["humidity_mean_roll4_mean"] - df["humidity_mean_roll13_mean"]
+    if "prec_sum" in weekly.columns:
+        for window in [4, 8, 13]:
+            weekly[f"prec_sum_roll_sum_{window}"] = (
+                weekly.groupby("region_id")["prec_sum"]
+                .rolling(window, min_periods=1)
+                .sum()
+                .reset_index(level=0, drop=True)
+            )
 
-    if "tmp_mean_roll4_mean" in df.columns and "tmp_mean_roll13_mean" in df.columns:
-        df["tmp_4w_vs_13w"] = df["tmp_mean_roll4_mean"] - df["tmp_mean_roll13_mean"]
+    if "prec_sum_roll_sum_4" in weekly.columns and "prec_sum_roll_sum_13" in weekly.columns:
+        weekly["prec_4w_vs_13w"] = weekly["prec_sum_roll_sum_4"] - weekly["prec_sum_roll_sum_13"] / 13 * 4
 
-    return df
+    if "humidity_mean_roll_mean_4" in weekly.columns and "humidity_mean_roll_mean_13" in weekly.columns:
+        weekly["humidity_4w_vs_13w"] = weekly["humidity_mean_roll_mean_4"] - weekly["humidity_mean_roll_mean_13"]
 
+    if "tmp_mean_roll_mean_4" in weekly.columns and "tmp_mean_roll_mean_13" in weekly.columns:
+        weekly["tmp_4w_vs_13w"] = weekly["tmp_mean_roll_mean_4"] - weekly["tmp_mean_roll_mean_13"]
 
-def add_score_lags(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.sort_values(["region_id", "week_idx"]).copy()
+    return weekly
 
-    for lag in SCORE_LAGS:
-        df[f"score_lag_{lag}"] = df.groupby("region_id")["score"].shift(lag)
-
-    for window in [4, 8, 12]:
-        df[f"score_roll{window}_mean"] = (
-            df.groupby("region_id")["score"]
-            .transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
-        )
-        df[f"score_roll{window}_std"] = (
-            df.groupby("region_id")["score"]
-            .transform(lambda s: s.shift(1).rolling(window, min_periods=2).std())
-            .fillna(0)
-        )
-
-    return df
-
-
-def build_region_features(train_weekly: pd.DataFrame):
-    train_scored = train_weekly.dropna(subset=["score"]).copy()
+def add_region_seasonal_features(train_weekly):
+    train_weekly = train_weekly.copy()
 
     region_mean = (
-        train_scored.groupby("region_id")["score"]
+        train_weekly.groupby("region_id")["score"]
         .mean()
+        .rename("region_score_mean")
         .reset_index()
-        .rename(columns={"score": "region_score_mean"})
     )
 
-    region_month = (
-        train_scored.groupby(["region_id", "month"])["score"]
+    region_month_mean = (
+        train_weekly.groupby(["region_id", "month"])["score"]
         .mean()
+        .rename("region_month_score_mean")
         .reset_index()
-        .rename(columns={"score": "future_region_month_score_mean"})
     )
 
-    return region_mean, region_month
+    return region_mean, region_month_mean
 
 
-def get_feature_columns(df: pd.DataFrame):
-    exclude = {
-        "score",
-        "target",
-        "region_id",
-        "date",
-    }
+def build_horizon_train_table(train_weekly, region_mean, region_month_mean):
+    """
+    Creates:
+    features at week t -> target score at week t+1 ... t+5
 
-    feature_cols = []
-    for col in df.columns:
-        if col in exclude:
-            continue
-        if pd.api.types.is_numeric_dtype(df[col]):
-            feature_cols.append(col)
+    Memory-safe version:
+    uses only the last 450 weeks per region.
+    """
+    rows = []
 
-    return feature_cols
+    base = train_weekly.copy()
 
+    # Keep only recent history to avoid RAM explosion.
+    base = (
+        base.sort_values(["region_id", "week_idx"])
+        .groupby("region_id")
+        .tail(450)
+        .reset_index(drop=True)
+    )
+
+    base = base.merge(region_mean, on="region_id", how="left")
+
+    for h in range(1, 6):
+        print(f"  creating horizon {h} training rows...")
+
+        part = base.copy()
+        part["horizon"] = h
+
+        part["target"] = part.groupby("region_id")["score"].shift(-h)
+        part["future_month"] = part.groupby("region_id")["month"].shift(-h)
+        part["future_dayofyear"] = part.groupby("region_id")["dayofyear"].shift(-h)
+
+        part = part[part["target"].notna()]
+
+        part = part.merge(
+            region_month_mean.rename(columns={
+                "month": "future_month",
+                "region_month_score_mean": "future_region_month_score_mean"
+            }),
+            on=["region_id", "future_month"],
+            how="left"
+        )
+
+        rows.append(part)
+
+    result = pd.concat(rows, ignore_index=True)
+
+    result["future_month_sin"] = np.sin(2 * np.pi * result["future_month"] / 12)
+    result["future_month_cos"] = np.cos(2 * np.pi * result["future_month"] / 12)
+    result["future_doy_sin"] = np.sin(2 * np.pi * result["future_dayofyear"] / 366)
+    result["future_doy_cos"] = np.cos(2 * np.pi * result["future_dayofyear"] / 366)
+
+    # Reduce memory usage.
+    float_cols = result.select_dtypes(include=["float64"]).columns
+    result[float_cols] = result[float_cols].astype("float32")
+
+    int_cols = result.select_dtypes(include=["int64"]).columns
+    result[int_cols] = result[int_cols].astype("int32")
+
+    return result
 
 def predict_test_week_scores(train_weekly, test_weekly):
+    """
+    Stage 1 improved:
+    Predict the missing score for each of the 13 observed test weeks sequentially.
+    This uses score lags from train history and then feeds predicted test-week scores
+    forward into the next test weeks.
+    """
     print("Predicting missing scores for the 13 observed test weeks sequentially...")
 
-    train_model_data = train_weekly.dropna(subset=["score"]).copy()
-    feature_cols = get_feature_columns(train_model_data)
+    train_hist = train_weekly.copy()
+    test_rows = test_weekly.copy()
+
+    train_hist = train_hist.sort_values(["region_id", "week_idx"]).reset_index(drop=True)
+    test_rows = test_rows.sort_values(["region_id", "week_idx"]).reset_index(drop=True)
+
+    # Train Stage-1 model on historical weekly rows.
+    train_rows = train_hist[train_hist["score"].notna()].copy()
+
+    exclude = {"region_id", "date", "score", "target"}
+    feature_cols = []
+
+    for col in train_rows.columns:
+        if col in exclude:
+            continue
+        if col not in test_rows.columns:
+            continue
+        if train_rows[col].dtype == "object":
+            continue
+        feature_cols.append(col)
+
+    X_train = train_rows[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+    y_train = train_rows["score"].astype(float)
 
     model = LGBMRegressor(
         objective="regression_l1",
-        n_estimators=300,
-        learning_rate=0.05,
+        metric="mae",
+        n_estimators=500,
+        learning_rate=0.04,
         num_leaves=63,
         min_child_samples=80,
         subsample=0.85,
         colsample_bytree=0.85,
         reg_alpha=0.2,
         reg_lambda=0.4,
-        random_state=42,
-        verbose=-1,
+        random_state=123,
+        n_jobs=-1,
+        verbosity=-1
     )
 
-    X = train_model_data[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-    y = train_model_data["score"]
-    model.fit(X, y)
+    model.fit(X_train, y_train)
 
-    test_original = test_weekly.copy()
-    test_shifted = test_weekly.copy()
+    predicted_parts = []
 
-    last_train_week = train_weekly.groupby("region_id")["week_idx"].max().reset_index()
-    last_train_week = last_train_week.rename(columns={"week_idx": "last_train_week"})
+    for region, g_test in test_rows.groupby("region_id"):
+        g_test = g_test.sort_values("week_idx").copy()
 
-    test_shifted = test_shifted.merge(last_train_week, on="region_id", how="left")
-    test_shifted["orig_week_idx"] = test_shifted["week_idx"]
-    test_shifted["week_idx"] = test_shifted["last_train_week"] + 1 + test_shifted["week_idx"]
-    test_shifted = test_shifted.drop(columns=["last_train_week"])
+        hist = train_hist[train_hist["region_id"] == region].copy()
+        hist = hist.sort_values("week_idx").copy()
 
-    combined = pd.concat([train_weekly, test_shifted], ignore_index=True, sort=False)
+        region_predictions = []
 
-    test_abs_weeks = sorted(test_shifted["week_idx"].unique())
+        for _, row in g_test.iterrows():
+            row_df = pd.DataFrame([row]).copy()
 
-    for week in test_abs_weeks:
-        combined = add_score_lags(combined)
-        rows = combined["week_idx"].eq(week) & combined["score"].isna()
+            # Add current score-lag features from hist, including earlier predicted test weeks.
+            hist_scores = hist[hist["score"].notna()].sort_values("week_idx")
 
-        X_test = combined.loc[rows, feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        preds = model.predict(X_test)
-        preds = np.clip(preds, 0, 5)
+            for lag in [1, 2, 3, 4, 8, 12]:
+                if len(hist_scores) >= lag:
+                    row_df[f"score_lag_{lag}"] = float(hist_scores.iloc[-lag]["score"])
+                else:
+                    row_df[f"score_lag_{lag}"] = np.nan
 
-        combined.loc[rows, "score"] = preds
+            for window in [4, 8, 12]:
+                last_scores = hist_scores["score"].tail(window)
+                row_df[f"score_roll_mean_{window}"] = float(last_scores.mean()) if len(last_scores) > 0 else np.nan
+                row_df[f"score_roll_std_{window}"] = float(last_scores.std()) if len(last_scores) > 1 else np.nan
 
-    predicted = combined[combined["orig_week_idx"].notna()].copy()
-    predicted["week_idx"] = predicted["orig_week_idx"].astype(np.int32)
-    predicted = predicted.drop(columns=["orig_week_idx"], errors="ignore")
+            # Ensure all features exist.
+            for col in feature_cols:
+                if col not in row_df.columns:
+                    row_df[col] = np.nan
 
-    test_original = test_original.drop(columns=["score"], errors="ignore")
-    predicted_scores = predicted[["region_id", "week_idx", "score"]]
+            X_one = row_df[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
 
-    out = test_original.merge(predicted_scores, on=["region_id", "week_idx"], how="left")
+            pred = float(np.clip(model.predict(X_one)[0], 0, 5))
+
+            row_out = row.copy()
+            row_out["score"] = pred
+            region_predictions.append(row_out)
+
+            # Feed predicted score into history for next test week.
+            hist_add = row.copy()
+            hist_add["score"] = pred
+            hist = pd.concat([hist, pd.DataFrame([hist_add])], ignore_index=True, sort=False)
+
+        predicted_parts.append(pd.DataFrame(region_predictions))
+
+    test_pred = pd.concat(predicted_parts, ignore_index=True)
 
     print("Predicted test-week score summary:")
-    print(out["score"].describe())
+    print(test_pred["score"].describe())
 
-    return out
+    return test_pred
 
-
-def build_horizon_train_table(train_weekly, region_mean, region_month, train_window=450):
-    train_weekly = train_weekly.sort_values(["region_id", "week_idx"]).copy()
-
-    # Keep the most recent history per region. This was the best public-LB window.
-    train_recent = (
-        train_weekly.groupby("region_id", group_keys=False)
-        .tail(train_window)
-        .copy()
-    )
-
-    frames = []
-
-    for horizon in range(1, 6):
-        print(f"  creating horizon {horizon} training rows...")
-
-        temp = train_recent.copy()
-        temp["horizon"] = horizon
-        temp["target"] = temp.groupby("region_id")["score"].shift(-horizon)
-        temp["future_month"] = temp.groupby("region_id")["month"].shift(-horizon)
-        temp["future_dayofyear"] = temp.groupby("region_id")["dayofyear"].shift(-horizon)
-
-        temp = temp.dropna(subset=["target", "score"])
-
-        temp["future_month_sin"] = np.sin(2 * np.pi * temp["future_month"] / 12)
-        temp["future_month_cos"] = np.cos(2 * np.pi * temp["future_month"] / 12)
-        temp["future_dayofyear_sin"] = np.sin(2 * np.pi * temp["future_dayofyear"] / 365)
-        temp["future_dayofyear_cos"] = np.cos(2 * np.pi * temp["future_dayofyear"] / 365)
-
-        temp = temp.merge(region_mean, on="region_id", how="left")
-        temp = temp.merge(
-            region_month,
-            left_on=["region_id", "future_month"],
-            right_on=["region_id", "month"],
-            how="left",
-            suffixes=("", "_rm")
-        )
-        temp = temp.drop(columns=["month_rm"], errors="ignore")
-
-        frames.append(temp)
-
-    out = pd.concat(frames, ignore_index=True, sort=False)
-
-    for col in out.select_dtypes(include=["float64"]).columns:
-        out[col] = out[col].astype(np.float32)
-
-    for col in out.select_dtypes(include=["int64"]).columns:
-        out[col] = out[col].astype(np.int32)
-
-    return out
-
-
-def build_test_horizon_table(train_weekly, test_weekly, region_mean, region_month):
-    last_train_week = train_weekly.groupby("region_id")["week_idx"].max().reset_index()
-    last_train_week = last_train_week.rename(columns={"week_idx": "last_train_week"})
-
-    test_shifted = test_weekly.copy()
-    test_shifted = test_shifted.merge(last_train_week, on="region_id", how="left")
-    test_shifted["week_idx"] = test_shifted["last_train_week"] + 1 + test_shifted["week_idx"]
-    test_shifted = test_shifted.drop(columns=["last_train_week"])
-
-    train_plus_test = pd.concat([train_weekly, test_shifted], ignore_index=True, sort=False)
-    train_plus_test = add_score_lags(train_plus_test)
-
-    latest = (
-        train_plus_test.sort_values(["region_id", "week_idx"])
-        .groupby("region_id", as_index=False)
+def build_test_horizon_table(test_weekly, train_weekly, region_mean, region_month_mean):
+    last_test_week = (
+        test_weekly.sort_values(["region_id", "week_idx"])
+        .groupby("region_id")
         .tail(1)
         .copy()
     )
 
-    frames = []
+    latest_train = train_weekly.sort_values(["region_id", "week_idx"]).copy()
 
-    for horizon in range(1, 6):
-        temp = latest.copy()
-        temp["horizon"] = horizon
-
-        temp["future_dayofyear"] = ((temp["dayofyear"] + 7 * horizon - 1) % 365) + 1
-        temp["future_month"] = temp["month"]
-
-        temp["future_month_sin"] = np.sin(2 * np.pi * temp["future_month"] / 12)
-        temp["future_month_cos"] = np.cos(2 * np.pi * temp["future_month"] / 12)
-        temp["future_dayofyear_sin"] = np.sin(2 * np.pi * temp["future_dayofyear"] / 365)
-        temp["future_dayofyear_cos"] = np.cos(2 * np.pi * temp["future_dayofyear"] / 365)
-
-        temp = temp.merge(region_mean, on="region_id", how="left")
-        temp = temp.merge(
-            region_month,
-            left_on=["region_id", "future_month"],
-            right_on=["region_id", "month"],
-            how="left",
-            suffixes=("", "_rm")
+    # Add score lags from latest training history.
+    for lag in [1, 2, 3, 4, 8, 12]:
+        lag_df = (
+            latest_train[["region_id", "week_idx", "score"]]
+            .dropna(subset=["score"])
+            .sort_values(["region_id", "week_idx"])
+            .groupby("region_id")
+            .tail(lag)
+            .groupby("region_id")
+            .head(1)
+            [["region_id", "score"]]
+            .rename(columns={"score": f"score_lag_{lag}"})
         )
-        temp = temp.drop(columns=["month_rm"], errors="ignore")
 
-        frames.append(temp)
+        last_test_week = last_test_week.merge(lag_df, on="region_id", how="left")
 
-    out = pd.concat(frames, ignore_index=True, sort=False)
-    return out
+    # Rolling score stats from latest training history.
+    for window in [4, 8, 12]:
+        tmp = (
+            latest_train[["region_id", "week_idx", "score"]]
+            .dropna(subset=["score"])
+            .sort_values(["region_id", "week_idx"])
+            .groupby("region_id")
+            .tail(window)
+            .groupby("region_id")["score"]
+            .agg(["mean", "std"])
+            .reset_index()
+            .rename(columns={
+                "mean": f"score_roll_mean_{window}",
+                "std": f"score_roll_std_{window}"
+            })
+        )
+
+        last_test_week = last_test_week.merge(tmp, on="region_id", how="left")
+
+    last_test_week = last_test_week.merge(region_mean, on="region_id", how="left")
+
+    rows = []
+
+    for _, row in last_test_week.iterrows():
+        for h in range(1, 6):
+            r = row.copy()
+            r["horizon"] = h
+
+            future_dayofyear = int(((int(row["dayofyear"]) - 1 + 7 * h) % 365) + 1)
+            pseudo_future = pd.Timestamp("2001-01-01") + pd.Timedelta(days=future_dayofyear - 1)
+
+            r["future_dayofyear"] = future_dayofyear
+            r["future_month"] = int(pseudo_future.month)
+
+            rows.append(r)
+
+    test_h = pd.DataFrame(rows)
+
+    test_h = test_h.merge(
+        region_month_mean.rename(columns={
+            "month": "future_month",
+            "region_month_score_mean": "future_region_month_score_mean"
+        }),
+        on=["region_id", "future_month"],
+        how="left"
+    )
+
+    test_h["future_month_sin"] = np.sin(2 * np.pi * test_h["future_month"] / 12)
+    test_h["future_month_cos"] = np.cos(2 * np.pi * test_h["future_month"] / 12)
+    test_h["future_doy_sin"] = np.sin(2 * np.pi * test_h["future_dayofyear"] / 366)
+    test_h["future_doy_cos"] = np.cos(2 * np.pi * test_h["future_dayofyear"] / 366)
+
+    return test_h
+
+def get_feature_columns(df):
+    exclude = {
+        "region_id",
+        "date",
+        "score",
+        "target"
+    }
+
+    feature_cols = []
+
+    for col in df.columns:
+        if col in exclude:
+            continue
+        if df[col].dtype == "object":
+            continue
+        feature_cols.append(col)
+
+    return feature_cols
 
 
 def train_predict(train_h, test_h, feature_cols):
-    preds = []
+    test_h = test_h.copy()
+    test_h["model_pred"] = np.nan
 
-    for horizon in range(1, 6):
-        print(f"\nTraining horizon {horizon}...")
+    validation_scores = []
 
-        tr = train_h[train_h["horizon"] == horizon].copy()
-        te = test_h[test_h["horizon"] == horizon].copy()
+    for h in range(1, 6):
+        print(f"\nTraining horizon {h}...")
 
-        cutoff = tr["week_idx"].quantile(0.8)
-        train_part = tr[tr["week_idx"] <= cutoff]
-        valid_part = tr[tr["week_idx"] > cutoff]
+        tr = train_h[train_h["horizon"] == h].copy()
+        te_idx = test_h[test_h["horizon"] == h].index
 
-        X_train = train_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        y_train = train_part["target"]
+        # Use last 20% of weeks as validation.
+        cutoff = tr["week_idx"].quantile(0.80)
 
-        X_valid = valid_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        y_valid = valid_part["target"]
+        train_part = tr[tr["week_idx"] < cutoff].copy()
+        valid_part = tr[tr["week_idx"] >= cutoff].copy()
+
+        X_train = train_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+        y_train = train_part["target"].astype(float)
+
+        X_valid = valid_part[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+        y_valid = valid_part["target"].astype(float)
+
+        X_full = tr[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
+        y_full = tr["target"].astype(float)
+
+        X_test = test_h.loc[te_idx, feature_cols].replace([np.inf, -np.inf], np.nan).fillna(-999)
 
         model = LGBMRegressor(
             objective="regression_l1",
+            metric="mae",
             n_estimators=400,
             learning_rate=0.04,
             num_leaves=63,
@@ -382,20 +508,21 @@ def train_predict(train_h, test_h, feature_cols):
             reg_alpha=0.2,
             reg_lambda=0.4,
             random_state=42,
-            verbose=-1,
+            n_jobs=-1,
+            verbosity=-1
         )
 
         model.fit(X_train, y_train)
 
         valid_pred = np.clip(model.predict(X_valid), 0, 5)
         mae = mean_absolute_error(y_valid, valid_pred)
-        print(f"Horizon {horizon} validation MAE: {mae:.5f}")
+        validation_scores.append(mae)
 
-        X_full = tr[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        y_full = tr["target"]
+        print(f"Horizon {h} validation MAE: {mae:.5f}")
 
         final_model = LGBMRegressor(
             objective="regression_l1",
+            metric="mae",
             n_estimators=400,
             learning_rate=0.04,
             num_leaves=63,
@@ -405,83 +532,116 @@ def train_predict(train_h, test_h, feature_cols):
             reg_alpha=0.2,
             reg_lambda=0.4,
             random_state=42,
-            verbose=-1,
+            n_jobs=-1,
+            verbosity=-1
         )
 
         final_model.fit(X_full, y_full)
 
-        X_test = te[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0)
-        pred = np.clip(final_model.predict(X_test), 0, 5)
+        test_pred = np.clip(final_model.predict(X_test), 0, 5)
+        test_h.loc[te_idx, "model_pred"] = test_pred
 
-        temp = te[["region_id", "horizon", "future_region_month_score_mean", "region_score_mean"]].copy()
-        temp["model_pred"] = pred
-        preds.append(temp)
+    print("\nValidation MAE by horizon:", [round(x, 5) for x in validation_scores])
+    print("Mean validation MAE:", round(float(np.mean(validation_scores)), 5))
 
-    return pd.concat(preds, ignore_index=True)
+    return test_h
 
 
-def build_submission(preds, sample_sub):
-    preds = preds.copy()
+def build_submission(test_h, sample):
+    test_h = test_h.copy()
 
-    seasonal = preds["future_region_month_score_mean"]
-    seasonal = seasonal.fillna(preds["region_score_mean"])
+    seasonal = test_h["future_region_month_score_mean"].copy()
+    seasonal = seasonal.fillna(test_h["region_score_mean"])
     seasonal = seasonal.fillna(0.85)
 
-    preds["prediction"] = 0.80 * preds["model_pred"] + 0.20 * seasonal
-    preds["prediction"] = preds["prediction"].clip(0, 5)
+    test_h["pred"] = 0.80 * test_h["model_pred"] + 0.20 * seasonal
+    test_h["pred"] = test_h["pred"].clip(0, 5)
 
-    wide = preds.pivot(index="region_id", columns="horizon", values="prediction").reset_index()
-    wide.columns = ["region_id"] + [f"pred_week{i}" for i in range(1, 6)]
+    rows = []
 
-    submission = sample_sub[["region_id"]].merge(wide, on="region_id", how="left")
+    for region in sample["region_id"].astype(str):
+        g = test_h[test_h["region_id"].astype(str) == region].sort_values("horizon")
 
-    for col in [f"pred_week{i}" for i in range(1, 6)]:
+        row = {"region_id": region}
+
+        for h in range(1, 6):
+            gh = g[g["horizon"] == h]
+            if len(gh) == 0:
+                row[f"pred_week{h}"] = 0.85
+            else:
+                row[f"pred_week{h}"] = float(gh.iloc[0]["pred"])
+
+        rows.append(row)
+
+    submission = pd.DataFrame(rows)
+
+    submission = sample[["region_id"]].astype({"region_id": str}).merge(
+        submission,
+        on="region_id",
+        how="left"
+    )
+
+    for col in ["pred_week1", "pred_week2", "pred_week3", "pred_week4", "pred_week5"]:
         submission[col] = submission[col].fillna(0.85).clip(0, 5)
 
-    return submission
+    return submission[sample.columns]
 
 
 def main():
-    os.makedirs("outputs", exist_ok=True)
-
     print("Loading data...")
     train = pd.read_csv(TRAIN_PATH)
     test = pd.read_csv(TEST_PATH)
-    sample_sub = pd.read_csv(SAMPLE_SUB_PATH)
+    sample = pd.read_csv(SAMPLE_SUB_PATH)
 
     train = add_basic_columns(train)
     test = add_basic_columns(test)
 
     print("Building weekly tables...")
-    train_weekly = build_weekly_weather(train, has_score=True)
+
+    train_weekly = build_weekly_weather(train)
     train_weekly = add_weekly_weather_rollups(train_weekly)
     train_weekly = add_score_lags(train_weekly)
 
-    test_weekly = build_weekly_weather(test, has_score=False)
+    test_weekly = build_weekly_weather(test)
     test_weekly = add_weekly_weather_rollups(test_weekly)
 
-    region_mean, region_month = build_region_features(train_weekly)
+    region_mean, region_month_mean = add_region_seasonal_features(train_weekly)
 
     test_weekly = predict_test_week_scores(train_weekly, test_weekly)
 
+# Important:
+# test_weekly has week_idx 0..12, but chronologically it comes AFTER train_weekly.
+# Therefore we shift test week_idx behind the last training week per region.
+    train_last_week = (
+        train_weekly.groupby("region_id")["week_idx"]
+        .max()
+        .rename("train_last_week_idx")
+        .reset_index()
+    )
+
+    test_weekly = test_weekly.merge(train_last_week, on="region_id", how="left")
+    test_weekly["week_idx"] = test_weekly["week_idx"] + test_weekly["train_last_week_idx"] + 1
+    test_weekly = test_weekly.drop(columns=["train_last_week_idx"])
+
     print("Building horizon train/test tables...")
-    train_h = build_horizon_train_table(
-        train_weekly=train_weekly,
-        region_mean=region_mean,
-        region_month=region_month,
-        train_window=450,
+    train_h = build_horizon_train_table(train_weekly, region_mean, region_month_mean)
+
+# Use train history + predicted test-week scores for recent score lags.
+    train_plus_test_weekly = pd.concat(
+        [train_weekly, test_weekly],
+        ignore_index=True,
+        sort=False
     )
 
     test_h = build_test_horizon_table(
-        train_weekly=train_weekly,
-        test_weekly=test_weekly,
-        region_mean=region_mean,
-        region_month=region_month,
+        test_weekly,
+        train_plus_test_weekly,
+        region_mean,
+        region_month_mean
     )
 
-    # Align train and test feature columns.
     for col in train_h.columns:
-        if col not in test_h.columns:
+        if col not in test_h.columns and col != "target":
             test_h[col] = np.nan
 
     for col in test_h.columns:
@@ -490,23 +650,21 @@ def main():
 
     feature_cols = get_feature_columns(train_h)
 
-    print(f"train_h shape: {train_h.shape}")
-    print(f"test_h shape: {test_h.shape}")
-    print(f"number of features: {len(feature_cols)}")
+    print("train_h shape:", train_h.shape)
+    print("test_h shape:", test_h.shape)
+    print("number of features:", len(feature_cols))
 
-    preds = train_predict(train_h, test_h, feature_cols)
+    test_h = train_predict(train_h, test_h, feature_cols)
 
-    submission = build_submission(preds, sample_sub)
+    submission = build_submission(test_h, sample)
     submission.to_csv(OUTPUT_PATH, index=False)
 
-    print(f"\nSaved: {OUTPUT_PATH}")
-    print(f"Submission shape: {submission.shape}")
-    print(f"Null values: {submission.isna().sum().sum()}")
+    print("\nSaved:", OUTPUT_PATH)
+    print("Submission shape:", submission.shape)
+    print("Null values:", submission.isnull().sum().sum())
     print(submission.head())
-
     print("\nPrediction summary:")
-    print(submission[[f"pred_week{i}" for i in range(1, 6)]].describe())
-
+    print(submission.drop(columns=["region_id"]).describe())
 
 if __name__ == "__main__":
     main()
