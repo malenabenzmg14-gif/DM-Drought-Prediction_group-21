@@ -11,7 +11,7 @@ from sklearn.metrics import mean_absolute_error
 TRAIN_PATH = "data/train.csv"
 TEST_PATH = "data/test.csv"
 SAMPLE_SUB_PATH = "data/sample_submission.csv"
-OUTPUT_PATH = "submission_final_1.csv"
+OUTPUT_PATH = "outputs/submission_train450_seed123.csv"
 
 
 WEATHER_COLS = [
@@ -507,7 +507,7 @@ def train_predict(train_h, test_h, feature_cols):
             colsample_bytree=0.85,
             reg_alpha=0.2,
             reg_lambda=0.4,
-            random_state=42,
+            random_state=123,
             n_jobs=-1,
             verbosity=-1
         )
@@ -531,7 +531,7 @@ def train_predict(train_h, test_h, feature_cols):
             colsample_bytree=0.85,
             reg_alpha=0.2,
             reg_lambda=0.4,
-            random_state=42,
+            random_state=123,
             n_jobs=-1,
             verbosity=-1
         )
